@@ -170,9 +170,7 @@ def load_data_from_gsheets():
 # =========================================================
 
 def save_shift_to_gsheets(new_rows, user_name, user_pref):
-
     try:
-
         client = get_gspread_client()
 
         spreadsheet_name = st.secrets.get(
@@ -188,14 +186,6 @@ def save_shift_to_gsheets(new_rows, user_name, user_pref):
 
         shift_sheet = ss.worksheet("shifts")
 
-        all_records = shift_sheet.get_all_records()
-
-        # 今回のユーザーの古いデータを削除
-        filtered_records = [
-            r for r in all_records
-            if str(r.get("名前", "")) != str(user_name)
-        ]
-
         headers = [
             "名前",
             "開始",
@@ -204,32 +194,47 @@ def save_shift_to_gsheets(new_rows, user_name, user_pref):
             "表示区分"
         ]
 
-        new_sheet_data = [headers]
+        # ヘッダーがなければ作成
+        existing_values = shift_sheet.get_all_values()
 
-        # 既存ユーザーのデータを追加
-        for r in filtered_records:
-
-            new_sheet_data.append([
-                str(r.get(h, ""))
-                for h in headers
-            ])
-
-        # 今回のデータを追加
-        for nr in new_rows:
-
-            new_sheet_data.append([
-                str(nr.get(h, ""))
-                for h in headers
-            ])
-
-        # シートを一度クリア
-        shift_sheet.clear()
-
-        # データを書き込み
-        if new_sheet_data:
+        if not existing_values:
             shift_sheet.update(
-                "A1",
-                new_sheet_data
+                "A1:E1",
+                [headers]
+            )
+
+        # 現在のデータを取得
+        all_records = shift_sheet.get_all_records()
+
+        # このユーザーの既存行を探す
+        user_rows = []
+
+        for i, record in enumerate(all_records, start=2):
+            if str(record.get("名前", "")) == str(user_name):
+                user_rows.append(i)
+
+        # =================================================
+        # このユーザーの古いデータだけ削除
+        # =================================================
+
+        # 下の行から削除することで行番号のずれを防ぐ
+        for row_num in reversed(user_rows):
+            shift_sheet.delete_rows(row_num)
+
+        # =================================================
+        # 新しいシフトを追加
+        # =================================================
+
+        for nr in new_rows:
+            shift_sheet.append_row(
+                [
+                    str(nr.get("名前", user_name)),
+                    str(nr.get("開始", "")),
+                    str(nr.get("終了", "")),
+                    str(nr.get("希望順位", "")),
+                    str(nr.get("表示区分", ""))
+                ],
+                value_input_option="USER_ENTERED"
             )
 
         # =================================================
@@ -237,14 +242,6 @@ def save_shift_to_gsheets(new_rows, user_name, user_pref):
         # =================================================
 
         pref_sheet = ss.worksheet("prefs")
-
-        pref_records = pref_sheet.get_all_records()
-
-        # 今回のユーザーの古いアンケートを削除
-        filtered_prefs = [
-            r for r in pref_records
-            if str(r.get("名前", "")) != str(user_name)
-        ]
 
         p_headers = [
             "名前",
@@ -254,44 +251,52 @@ def save_shift_to_gsheets(new_rows, user_name, user_pref):
             "一人暮らし"
         ]
 
-        p_sheet_data = [p_headers]
+        existing_pref_values = pref_sheet.get_all_values()
 
-        # 既存データ
-        for r in filtered_prefs:
+        if not existing_pref_values:
+            pref_sheet.update(
+                "A1:E1",
+                [p_headers]
+            )
 
-            p_sheet_data.append([
-                str(r.get(h, ""))
-                for h in p_headers
-            ])
+        # 現在のアンケートを取得
+        pref_records = pref_sheet.get_all_records()
 
-        # 今回のユーザー
-        p_sheet_data.append([
+        # このユーザーの行を探す
+        pref_row = None
+
+        for i, record in enumerate(pref_records, start=2):
+            if str(record.get("名前", "")) == str(user_name):
+                pref_row = i
+                break
+
+        pref_data = [
             str(user_name),
             str(user_pref.get("9時間可能か", "-")),
             str(user_pref.get("理由", "-")),
             str(user_pref.get("入り方の希望", "-")),
             str(user_pref.get("一人暮らし", "-"))
-        ])
+        ]
 
-        # シートをクリア
-        pref_sheet.clear()
-
-        # データを書き込み
-        if p_sheet_data:
-
+        # 既存ユーザーならその行だけ更新
+        if pref_row is not None:
             pref_sheet.update(
-                "A1",
-                p_sheet_data
+                f"A{pref_row}:E{pref_row}",
+                [pref_data]
+            )
+
+        # 初めてなら新しい行を追加
+        else:
+            pref_sheet.append_row(
+                pref_data,
+                value_input_option="USER_ENTERED"
             )
 
     except Exception as e:
-
         st.error(
             f"⚠️ スプレッドシート保存詳細エラー: {e}"
         )
-
         raise e
-
 
 # =========================================================
 # データ定義
