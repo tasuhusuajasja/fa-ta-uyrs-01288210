@@ -42,6 +42,11 @@ st.markdown("""
 def get_gspread_client():
     scope = ["https://www.googleapis.com/auth/spreadsheets", "https://www.googleapis.com/auth/drive"]
     creds_dict = dict(st.secrets["gcp_service_account"])
+    
+    # 💡 改行文字のエスケープを実改行に変換
+    if "private_key" in creds_dict and isinstance(creds_dict["private_key"], str):
+        creds_dict["private_key"] = creds_dict["private_key"].replace("\\n", "\n")
+        
     creds = Credentials.from_service_account_info(creds_dict, scopes=scope)
     return gspread.authorize(creds)
 
@@ -163,7 +168,7 @@ if "auto_scheduled" not in st.session_state:
 
 # --- メインUI ---
 st.title("🍟 〜生駒祭屋台シフト提出用〜")
-st.markdown("希望する日時を追加して、最後に提出してください。（スプレッドシート安全同期版）")
+st.markdown("希望する日時を追加して、最後に提出してください。（PEM/改行対策・安全同期版）")
 
 st.markdown("""
 <div class="norma-box">
@@ -410,7 +415,8 @@ def draw_gantt_chart(data, title_suffix=""):
                 st.info(f"{target_day} のデータはまだありません。")
             else:
                 df_timeline = pd.DataFrame(day_shifts)
-                df_timeline["开始" if "开始" in df_timeline.columns else "開始"] = pd.to_datetime(df_timeline["開始"])
+                col_name = "开始" if "开始" in df_timeline.columns else "開始"
+                df_timeline["開始"] = pd.to_datetime(df_timeline[col_name])
                 df_timeline["終了"] = pd.to_datetime(df_timeline["終了"])
 
                 def get_sort_score(name):
@@ -644,14 +650,27 @@ if st.button("シフト案を自動作成する", type="primary", use_container_
                 current_shift = None
                 
                 for _, row in df_final.iterrows():
+                    col_start = "开始" if "开始" in row else "開始"
                     if current_shift is None:
-                        current_shift = row.to_dict()
+                        current_shift = {
+                            "名前": row["名前"],
+                            "開始": row[col_start],
+                            "終了": row["終了"],
+                            "希望順位": row.get("希望順位", "自動割当"),
+                            "表示区分": row.get("表示区分", "自動編成確定")
+                        }
                     else:
-                        if current_shift["名前"] == row["名前"] and current_shift["終了"] == row["开始" if "开始" in row else "開始"]:
+                        if current_shift["名前"] == row["名前"] and str(current_shift["終了"]) == str(row[col_start]):
                             current_shift["終了"] = row["終了"] 
                         else:
                             merged_schedule.append(current_shift)
-                            current_shift = row.to_dict()
+                            current_shift = {
+                                "名前": row["名前"],
+                                "開始": row[col_start],
+                                "終了": row["終了"],
+                                "希望順位": row.get("希望順位", "自動割当"),
+                                "表示区分": row.get("表示区分", "自動編成確定")
+                            }
                 if current_shift is not None:
                     merged_schedule.append(current_shift)
                 
