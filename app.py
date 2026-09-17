@@ -4,6 +4,7 @@ import plotly.express as px
 from datetime import datetime, timedelta
 import gspread
 from google.oauth2.service_account import Credentials
+import json
 
 # --- 初期設定・デザイン ---
 st.set_page_config(page_title="生駒祭屋台シフト提出用", layout="centered")
@@ -37,15 +38,29 @@ st.markdown("""
     </style>
 """, unsafe_allow_html=True)
 
-# --- スプレッドシート接続・読み書きヘルパー ---
+# --- スプレッドシート接続・読み書きヘルパー（PEM完全修復版） ---
 @st.cache_resource
 def get_gspread_client():
     scope = ["https://www.googleapis.com/auth/spreadsheets", "https://www.googleapis.com/auth/drive"]
     creds_dict = dict(st.secrets["gcp_service_account"])
     
-    pk = str(creds_dict.get("private_key", ""))
-    pk = pk.replace("\\n", "\n").replace('\r', '').strip()
-    creds_dict["private_key"] = pk
+    # 秘密鍵の文字列を徹底的にクリーニング・再構築
+    raw_pk = str(creds_dict.get("private_key", ""))
+    # 余分な外側クォーテーションや全角・制御の掃除
+    raw_pk = raw_pk.strip().strip('"').strip("'")
+    
+    # \n文字リテラルが残っている場合は本物の改行へ
+    if "\\n" in raw_pk:
+        raw_pk = raw_pk.replace("\\n", "\n")
+    
+    # BEGIN / END が確実に改行で区切られている形へ強制整形
+    if "BEGIN PRIVATE KEY" in raw_pk and "END PRIVATE KEY" in raw_pk:
+        start_idx = raw_pk.find("-----BEGIN PRIVATE KEY-----")
+        end_idx = raw_pk.find("-----END PRIVATE KEY-----") + len("-----END PRIVATE KEY-----")
+        pem_body = raw_pk[start_idx:end_idx]
+        creds_dict["private_key"] = pem_body.strip() + "\n"
+    else:
+        creds_dict["private_key"] = raw_pk
         
     creds = Credentials.from_service_account_info(creds_dict, scopes=scope)
     return gspread.authorize(creds)
@@ -168,7 +183,7 @@ if "auto_scheduled" not in st.session_state:
 
 # --- メインUI ---
 st.title("🍟 〜生駒祭屋台シフト提出用〜")
-st.markdown("希望する日時を追加して、最後に提出してください。（完全同期・PEM対策版）")
+st.markdown("希望する日時を追加して、最後に提出してください。（完全同期・PEM強力修復版）")
 
 st.markdown("""
 <div class="norma-box">
