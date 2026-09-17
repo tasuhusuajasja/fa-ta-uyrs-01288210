@@ -2,6 +2,7 @@ import streamlit as st
 import pandas as pd
 import plotly.express as px
 from datetime import datetime, timedelta
+import time
 import gspread
 from google.oauth2.service_account import Credentials
 
@@ -120,49 +121,71 @@ def get_gspread_client():
 # Google Sheetsからデータを読み込む
 # =========================================================
 
+@st.cache_data(ttl=10, show_spinner=False)
 def load_data_from_gsheets():
+    """
+    Google Sheetsからシフトとアンケートを読み込む。
 
-    try:
-        client = get_gspread_client()
+    Streamlitの再実行のたびにGoogle Sheetsへアクセスすると、
+    利用人数が増えたときにGoogle Sheets APIのRead quotaへ
+    到達しやすいため、10秒間キャッシュする。
+    """
 
-        spreadsheet_name = st.secrets.get(
-            "spreadsheet_name",
-            "ikomakai_db"
-        )
+    client = get_gspread_client()
 
-        ss = client.open(spreadsheet_name)
+    spreadsheet_name = st.secrets.get(
+        "spreadsheet_name",
+        "ikomakai_db"
+    )
 
-        # -------------------------------------------------
-        # shifts
-        # -------------------------------------------------
+    ss = client.open(spreadsheet_name)
 
-        shift_sheet = ss.worksheet("shifts")
+    # -------------------------------------------------
+    # shifts
+    # -------------------------------------------------
 
-        shift_data = shift_sheet.get_all_records()
+    shift_sheet = ss.worksheet("shifts")
+    shift_values = shift_sheet.get_all_values()
 
-        # -------------------------------------------------
-        # prefs
-        # -------------------------------------------------
+    shift_data = []
 
-        pref_sheet = ss.worksheet("prefs")
+    if shift_values:
+        headers = shift_values[0]
 
-        pref_records = pref_sheet.get_all_records()
+        for values in shift_values[1:]:
+            row = {}
 
-        prefs_dict = {}
+            for i, header in enumerate(headers):
+                row[header] = values[i] if i < len(values) else ""
 
-        for row in pref_records:
+            # 完全な空行は無視
+            if any(str(v).strip() for v in row.values()):
+                shift_data.append(row)
+
+    # -------------------------------------------------
+    # prefs
+    # -------------------------------------------------
+
+    pref_sheet = ss.worksheet("prefs")
+    pref_values = pref_sheet.get_all_values()
+
+    prefs_dict = {}
+
+    if pref_values:
+        headers = pref_values[0]
+
+        for values in pref_values[1:]:
+            row = {}
+
+            for i, header in enumerate(headers):
+                row[header] = values[i] if i < len(values) else ""
 
             name = row.pop("名前", None)
 
             if name:
                 prefs_dict[name] = row
 
-        return shift_data, prefs_dict
-
-    except Exception as e:
-
-        # 読み込み失敗時は空データを返す
-        return [], {}
+    return shift_data, prefs_dict
 
 
 # =========================================================
@@ -170,133 +193,206 @@ def load_data_from_gsheets():
 # =========================================================
 
 def save_shift_to_gsheets(new_rows, user_name, user_pref):
-    try:
-        client = get_gspread_client()
+    """
+    シフトとアンケートをGoogle Sheetsへ保存する。
 
-        spreadsheet_name = st.secrets.get(
-            "spreadsheet_name",
-            "ikomakai_db"
-        )
+    以前の「シート全体をclearして全データを書き直す」方式では、
+    複数人が同時に提出した際に他人のデータを上書きする可能性があった。
+    ここでは、現在のユーザーに関係する行だけを変更する。
 
-        ss = client.open(spreadsheet_name)
+    また、同じシートを1回の保存中に何度も読み込まないようにし、
+    429 (Read quota exceeded) が発生しにくい構成にしている。
+    """
 
-        # =================================================
-        # shifts 保存
-        # =================================================
+    client = get_gspread_client()
 
-        shift_sheet = ss.worksheet("shifts")
+    spreadsheet_name = st.secrets.get(
+        "spreadsheet_name",
+        "ikomakai_db"
+    )
 
-        headers = [
-            "名前",
-            "開始",
-            "終了",
-            "希望順位",
-            "表示区分"
-        ]
+    # 429が一時的に発生した場合だけ少し待って再試行する
+    retry_delays = [0, 2, 5, 10]
+    last_error = None
 
-        # ヘッダーがなければ作成
-        existing_values = shift_sheet.get_all_values()
+    for delay in retry_delays:
 
-        if not existing_values:
-            shift_sheet.update(
-                "A1:E1",
-                [headers]
-            )
+        if delay:
+            time.sleep(delay)
 
-        # 現在のデータを取得
-        all_records = shift_sheet.get_all_records()
+        try:
+            ss = client.open(spreadsheet_name)
 
-        # このユーザーの既存行を探す
-        user_rows = []
+            # =================================================
+            # shifts 保存
+            # =================================================
 
-        for i, record in enumerate(all_records, start=2):
-            if str(record.get("名前", "")) == str(user_name):
-                user_rows.append(i)
+            shift_sheet = ss.worksheet("shifts")
 
-        # =================================================
-        # このユーザーの古いデータだけ削除
-        # =================================================
+            headers = [
+                "名前",
+                "開始",
+                "終了",
+                "希望順位",
+                "表示区分"
+            ]
 
-        # 下の行から削除することで行番号のずれを防ぐ
-        for row_num in reversed(user_rows):
-            shift_sheet.delete_rows(row_num)
+            # 1回だけ読み込む
+            existing_values = shift_sheet.get_all_values()
 
-        # =================================================
-        # 新しいシフトを追加
-        # =================================================
+            # シートが空ならヘッダーを作る
+            if not existing_values:
+                shift_sheet.update(
+                    "A1:E1",
+                    [headers]
+                )
+                existing_values = [headers]
 
-        for nr in new_rows:
-            shift_sheet.append_row(
-                [
+            # A列の名前だけを見て、現在のユーザーの行を特定
+            user_rows = []
+
+            for row_num, row_values in enumerate(
+                existing_values[1:],
+                start=2
+            ):
+                name = (
+                    row_values[0]
+                    if len(row_values) > 0
+                    else ""
+                )
+
+                if str(name) == str(user_name):
+                    user_rows.append(row_num)
+
+            # -------------------------------------------------
+            # 現在のユーザーの古い行だけ削除
+            # -------------------------------------------------
+            # 下の行から削除することで、上の行番号がずれないようにする。
+            # Google Sheets APIへは1回のbatch_updateで送る。
+
+            if user_rows:
+                delete_requests = []
+
+                for row_num in reversed(user_rows):
+                    delete_requests.append({
+                        "deleteDimension": {
+                            "range": {
+                                "sheetId": shift_sheet.id,
+                                "dimension": "ROWS",
+                                "startIndex": row_num - 1,
+                                "endIndex": row_num
+                            }
+                        }
+                    })
+
+                ss.batch_update({
+                    "requests": delete_requests
+                })
+
+            # -------------------------------------------------
+            # 新しいシフトをまとめて追加
+            # -------------------------------------------------
+
+            shift_values_to_append = []
+
+            for nr in new_rows:
+                shift_values_to_append.append([
                     str(nr.get("名前", user_name)),
                     str(nr.get("開始", "")),
                     str(nr.get("終了", "")),
                     str(nr.get("希望順位", "")),
                     str(nr.get("表示区分", ""))
-                ],
-                value_input_option="USER_ENTERED"
-            )
+                ])
 
-        # =================================================
-        # prefs 保存
-        # =================================================
+            # append_rowを何回も呼ばず、append_rowsで1回にまとめる
+            if shift_values_to_append:
+                shift_sheet.append_rows(
+                    shift_values_to_append,
+                    value_input_option="USER_ENTERED"
+                )
 
-        pref_sheet = ss.worksheet("prefs")
+            # =================================================
+            # prefs 保存
+            # =================================================
 
-        p_headers = [
-            "名前",
-            "9時間可能か",
-            "理由",
-            "入り方の希望",
-            "一人暮らし"
-        ]
+            pref_sheet = ss.worksheet("prefs")
 
-        existing_pref_values = pref_sheet.get_all_values()
+            p_headers = [
+                "名前",
+                "9時間可能か",
+                "理由",
+                "入り方の希望",
+                "一人暮らし"
+            ]
 
-        if not existing_pref_values:
-            pref_sheet.update(
-                "A1:E1",
-                [p_headers]
-            )
+            # prefsも1回だけ読み込む
+            existing_pref_values = pref_sheet.get_all_values()
 
-        # 現在のアンケートを取得
-        pref_records = pref_sheet.get_all_records()
+            if not existing_pref_values:
+                pref_sheet.update(
+                    "A1:E1",
+                    [p_headers]
+                )
+                existing_pref_values = [p_headers]
 
-        # このユーザーの行を探す
-        pref_row = None
+            pref_row = None
 
-        for i, record in enumerate(pref_records, start=2):
-            if str(record.get("名前", "")) == str(user_name):
-                pref_row = i
+            for row_num, row_values in enumerate(
+                existing_pref_values[1:],
+                start=2
+            ):
+                name = (
+                    row_values[0]
+                    if len(row_values) > 0
+                    else ""
+                )
+
+                if str(name) == str(user_name):
+                    pref_row = row_num
+                    break
+
+            pref_data = [
+                str(user_name),
+                str(user_pref.get("9時間可能か", "-")),
+                str(user_pref.get("理由", "-")),
+                str(user_pref.get("入り方の希望", "-")),
+                str(user_pref.get("一人暮らし", "-"))
+            ]
+
+            # 既存ユーザーならその行だけ更新
+            if pref_row is not None:
+                pref_sheet.update(
+                    f"A{pref_row}:E{pref_row}",
+                    [pref_data],
+                    value_input_option="USER_ENTERED"
+                )
+
+            # 初めてなら新しい行を追加
+            else:
+                pref_sheet.append_row(
+                    pref_data,
+                    value_input_option="USER_ENTERED"
+                )
+
+            # -------------------------------------------------
+            # キャッシュを消す
+            # -------------------------------------------------
+            # 次回の読み込みで保存直後の最新データを取得できるようにする。
+            st.cache_data.clear()
+
+            return
+
+        except Exception as e:
+            last_error = e
+
+            # 429以外はすぐにエラーにする
+            if "429" not in str(e) and "Quota exceeded" not in str(e):
                 break
 
-        pref_data = [
-            str(user_name),
-            str(user_pref.get("9時間可能か", "-")),
-            str(user_pref.get("理由", "-")),
-            str(user_pref.get("入り方の希望", "-")),
-            str(user_pref.get("一人暮らし", "-"))
-        ]
-
-        # 既存ユーザーならその行だけ更新
-        if pref_row is not None:
-            pref_sheet.update(
-                f"A{pref_row}:E{pref_row}",
-                [pref_data]
-            )
-
-        # 初めてなら新しい行を追加
-        else:
-            pref_sheet.append_row(
-                pref_data,
-                value_input_option="USER_ENTERED"
-            )
-
-    except Exception as e:
-        st.error(
-            f"⚠️ スプレッドシート保存詳細エラー: {e}"
-        )
-        raise e
+    st.error(
+        f"⚠️ スプレッドシート保存詳細エラー: {last_error}"
+    )
+    raise last_error
 
 # =========================================================
 # データ定義
@@ -969,8 +1065,9 @@ with btn_col2:
             # 現在のシフトを取得
             # -----------------------------------------
 
-            current_shifts, _ = (
-                load_data_from_gsheets()
+            current_shifts = st.session_state.get(
+                "submitted_shifts",
+                []
             )
 
             submitted_days = set(
@@ -1076,6 +1173,10 @@ with btn_col2:
                 current_name,
                 new_pref_data
             )
+
+            # 今回保存した内容をセッションにも反映
+            st.session_state.submitted_shifts = filtered_shifts
+            st.session_state.user_prefs[current_name] = new_pref_data
 
             st.balloons()
 
