@@ -43,10 +43,8 @@ def get_gspread_client():
     scope = ["https://www.googleapis.com/auth/spreadsheets", "https://www.googleapis.com/auth/drive"]
     creds_dict = dict(st.secrets["gcp_service_account"])
     
-    # 💡 クォーテーション＆改行エスケープ完全除去・実改行化
     pk = str(creds_dict.get("private_key", ""))
-    pk = pk.strip().strip('"').strip("'")
-    pk = pk.replace("\\n", "\n")
+    pk = pk.replace("\\n", "\n").replace('\r', '').strip()
     creds_dict["private_key"] = pk
         
     creds = Credentials.from_service_account_info(creds_dict, scopes=scope)
