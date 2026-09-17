@@ -126,9 +126,14 @@ def load_data_from_gsheets():
     """
     Google Sheetsからシフトとアンケートを読み込む。
 
-    Streamlitの再実行のたびにGoogle Sheetsへアクセスすると、
-    利用人数が増えたときにGoogle Sheets APIのRead quotaへ
-    到達しやすいため、10秒間キャッシュする。
+    shifts と prefs を別々に get_all_values() すると、
+    1回の画面更新でRead requestを2回消費する。
+    ここでは Sheets API の batchGet を使い、2つの範囲を
+    1回のRead requestにまとめる。
+
+    さらに10秒間Streamlit側でキャッシュすることで、
+    30人程度が利用しても画面の再実行ごとにGoogle Sheetsへ
+    読みに行かないようにする。
     """
 
     client = get_gspread_client()
@@ -140,12 +145,31 @@ def load_data_from_gsheets():
 
     ss = client.open(spreadsheet_name)
 
+    # Google Sheets APIのbatchGetで2シートを1回で読む。
+    # Google公式ドキュメントでも複数の読み取りはbatchGetで
+    # まとめることが推奨されている。
+    batch_result = ss.values_batch_get([
+        "shifts!A:E",
+        "prefs!A:E"
+    ])
+
+    value_ranges = batch_result.get("valueRanges", [])
+
+    shift_values = (
+        value_ranges[0].get("values", [])
+        if len(value_ranges) > 0
+        else []
+    )
+
+    pref_values = (
+        value_ranges[1].get("values", [])
+        if len(value_ranges) > 1
+        else []
+    )
+
     # -------------------------------------------------
     # shifts
     # -------------------------------------------------
-
-    shift_sheet = ss.worksheet("shifts")
-    shift_values = shift_sheet.get_all_values()
 
     shift_data = []
 
@@ -165,9 +189,6 @@ def load_data_from_gsheets():
     # -------------------------------------------------
     # prefs
     # -------------------------------------------------
-
-    pref_sheet = ss.worksheet("prefs")
-    pref_values = pref_sheet.get_all_values()
 
     prefs_dict = {}
 
@@ -196,12 +217,16 @@ def save_shift_to_gsheets(new_rows, user_name, user_pref):
     """
     シフトとアンケートをGoogle Sheetsへ保存する。
 
-    以前の「シート全体をclearして全データを書き直す」方式では、
-    複数人が同時に提出した際に他人のデータを上書きする可能性があった。
-    ここでは、現在のユーザーに関係する行だけを変更する。
-
-    また、同じシートを1回の保存中に何度も読み込まないようにし、
-    429 (Read quota exceeded) が発生しにくい構成にしている。
+    【429対策】
+    - shifts と prefs の読み込みを batchGet で1回にまとめる
+    - get_all_values() / get_all_records() の複数回読み込みをしない
+    - シート全体をclearして書き直さない
+    - シフトは自分の行だけ削除して、新しい行をまとめて追加
+    - prefsも自分の行だけ更新
+    - 保存後に st.cache_data.clear() を呼ばない
+      （全ユーザー共通キャッシュを毎回消すと、他ユーザーの
+       次回アクセスで大量のRead requestが発生するため）
+    - 429が一時的に発生した場合は指数的に待って再試行
     """
 
     client = get_gspread_client()
@@ -211,8 +236,8 @@ def save_shift_to_gsheets(new_rows, user_name, user_pref):
         "ikomakai_db"
     )
 
-    # 429が一時的に発生した場合だけ少し待って再試行する
-    retry_delays = [0, 2, 5, 10]
+    # 429対策。通常は最初の試行で成功する。
+    retry_delays = [0, 2, 5, 10, 20]
     last_error = None
 
     for delay in retry_delays:
@@ -222,6 +247,29 @@ def save_shift_to_gsheets(new_rows, user_name, user_pref):
 
         try:
             ss = client.open(spreadsheet_name)
+
+            # =================================================
+            # shifts / prefs を1回のbatchGetで取得
+            # =================================================
+
+            batch_result = ss.values_batch_get([
+                "shifts!A:E",
+                "prefs!A:E"
+            ])
+
+            value_ranges = batch_result.get("valueRanges", [])
+
+            existing_values = (
+                value_ranges[0].get("values", [])
+                if len(value_ranges) > 0
+                else []
+            )
+
+            existing_pref_values = (
+                value_ranges[1].get("values", [])
+                if len(value_ranges) > 1
+                else []
+            )
 
             # =================================================
             # shifts 保存
@@ -237,14 +285,12 @@ def save_shift_to_gsheets(new_rows, user_name, user_pref):
                 "表示区分"
             ]
 
-            # 1回だけ読み込む
-            existing_values = shift_sheet.get_all_values()
-
-            # シートが空ならヘッダーを作る
+            # シートが完全に空ならヘッダーを作成
             if not existing_values:
                 shift_sheet.update(
                     "A1:E1",
-                    [headers]
+                    [headers],
+                    value_input_option="USER_ENTERED"
                 )
                 existing_values = [headers]
 
@@ -267,12 +313,12 @@ def save_shift_to_gsheets(new_rows, user_name, user_pref):
             # -------------------------------------------------
             # 現在のユーザーの古い行だけ削除
             # -------------------------------------------------
-            # 下の行から削除することで、上の行番号がずれないようにする。
-            # Google Sheets APIへは1回のbatch_updateで送る。
 
             if user_rows:
                 delete_requests = []
 
+                # 下の行から削除することで、上の行番号が
+                # ずれないようにする。
                 for row_num in reversed(user_rows):
                     delete_requests.append({
                         "deleteDimension": {
@@ -285,6 +331,7 @@ def save_shift_to_gsheets(new_rows, user_name, user_pref):
                         }
                     })
 
+                # 削除リクエストは1回のbatchUpdateにまとめる
                 ss.batch_update({
                     "requests": delete_requests
                 })
@@ -304,7 +351,7 @@ def save_shift_to_gsheets(new_rows, user_name, user_pref):
                     str(nr.get("表示区分", ""))
                 ])
 
-            # append_rowを何回も呼ばず、append_rowsで1回にまとめる
+            # append_rowを何回も呼ばず、1回にまとめる
             if shift_values_to_append:
                 shift_sheet.append_rows(
                     shift_values_to_append,
@@ -325,13 +372,11 @@ def save_shift_to_gsheets(new_rows, user_name, user_pref):
                 "一人暮らし"
             ]
 
-            # prefsも1回だけ読み込む
-            existing_pref_values = pref_sheet.get_all_values()
-
             if not existing_pref_values:
                 pref_sheet.update(
                     "A1:E1",
-                    [p_headers]
+                    [p_headers],
+                    value_input_option="USER_ENTERED"
                 )
                 existing_pref_values = [p_headers]
 
@@ -375,24 +420,33 @@ def save_shift_to_gsheets(new_rows, user_name, user_pref):
                 )
 
             # -------------------------------------------------
-            # キャッシュを消す
+            # 重要：ここで st.cache_data.clear() をしない
             # -------------------------------------------------
-            # 次回の読み込みで保存直後の最新データを取得できるようにする。
-            st.cache_data.clear()
+            # cache_dataは全ユーザーで共有されるため、
+            # 1人の保存ごとに全キャッシュを消すと、
+            # その直後に各ユーザーが再度Sheetsを読み込み、
+            # Read quotaを急激に消費する原因になる。
 
             return
 
         except Exception as e:
             last_error = e
 
-            # 429以外はすぐにエラーにする
-            if "429" not in str(e) and "Quota exceeded" not in str(e):
+            error_text = str(e)
+
+            # 429 / quota超過なら少し待って再試行
+            if (
+                "429" not in error_text
+                and "Quota exceeded" not in error_text
+                and "quota" not in error_text.lower()
+            ):
                 break
 
     st.error(
         f"⚠️ スプレッドシート保存詳細エラー: {last_error}"
     )
     raise last_error
+
 
 # =========================================================
 # データ定義
