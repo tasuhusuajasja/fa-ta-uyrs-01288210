@@ -70,39 +70,44 @@ def save_shift_to_gsheets(new_rows, user_name, user_pref):
         client = get_gspread_client()
         ss = client.open(st.secrets.get("spreadsheet_name", "ikomakai_db"))
         
+        # --- shifts 保存 ---
         shift_sheet = ss.worksheet("shifts")
         all_records = shift_sheet.get_all_records()
-        filtered_records = [r for r in all_records if r.get("名前") != user_name]
+        filtered_records = [r for r in all_records if str(r.get("名前", "")) != str(user_name)]
         
         headers = ["名前", "開始", "終了", "希望順位", "表示区分"]
         new_sheet_data = [headers]
         for r in filtered_records:
-            new_sheet_data.append([r.get(h, "") for h in headers])
+            new_sheet_data.append([str(r.get(h, "")) for h in headers])
         for nr in new_rows:
-            new_sheet_data.append([nr.get(h, "") for h in headers])
+            new_sheet_data.append([str(nr.get(h, "")) for h in headers])
             
         shift_sheet.clear()
-        shift_sheet.update(new_sheet_data)
+        if new_sheet_data:
+            shift_sheet.update("A1", new_sheet_data)
         
-        # アンケート保存
+        # --- prefs 保存 ---
         pref_sheet = ss.worksheet("prefs")
         pref_records = pref_sheet.get_all_records()
-        filtered_prefs = [r for r in pref_records if r.get("名前") != user_name]
+        filtered_prefs = [r for r in pref_records if str(r.get("名前", "")) != str(user_name)]
         p_headers = ["名前", "9時間可能か", "理由", "入り方の希望", "一人暮らし"]
         p_sheet_data = [p_headers]
         for r in filtered_prefs:
-            p_sheet_data.append([r.get(h, "") for h in p_headers])
+            p_sheet_data.append([str(r.get(h, "")) for h in p_headers])
         p_sheet_data.append([
-            user_name,
-            user_pref["9時間可能か"],
-            user_pref["理由"],
-            user_pref["入り方の希望"],
-            user_pref["一人暮らし"]
+            str(user_name),
+            str(user_pref.get("9時間可能か", "-")),
+            str(user_pref.get("理由", "-")),
+            str(user_pref.get("入り方の希望", "-")),
+            str(user_pref.get("一人暮らし", "-"))
         ])
         pref_sheet.clear()
-        pref_sheet.update(p_sheet_data)
+        if p_sheet_data:
+            pref_sheet.update("A1", p_sheet_data)
+            
     except Exception as e:
-        st.error(f"スプレッドシート保存エラー: {e}")
+        st.error(f"⚠️ スプレッドシート保存詳細エラー: {e}")
+        raise e
 
 # --- データ定義 ---
 DAYS = ["11月2日(日)", "11月3日(月・祝)", "11月4日(火)"]
@@ -138,21 +143,27 @@ def calculate_hours(start_str, end_str):
     t_end = datetime.strptime(end_str, fmt)
     return (t_end - t_start).seconds / 3600
 
-# --- セッション状態の初期化 & 毎回最新を同期 ---
+# --- セッション状態の初期化 & 安全ロード ---
 if "shift_list" not in st.session_state:
     st.session_state.shift_list = []
 
-# 毎回ページ読み込み/リロード時にスプレッドシートから最新を取得して正とする
-gs_shifts, gs_prefs = load_data_from_gsheets()
-st.session_state.submitted_shifts = gs_shifts
-st.session_state.user_prefs = gs_prefs
+try:
+    gs_shifts, gs_prefs = load_data_from_gsheets()
+    st.session_state.submitted_shifts = gs_shifts if gs_shifts else []
+    st.session_state.user_prefs = gs_prefs if gs_prefs else {}
+except Exception as e:
+    st.error(f"データ読み込み時エラー: {e}")
+    if "submitted_shifts" not in st.session_state:
+        st.session_state.submitted_shifts = []
+    if "user_prefs" not in st.session_state:
+        st.session_state.user_prefs = {}
 
 if "auto_scheduled" not in st.session_state:
     st.session_state.auto_scheduled = []
 
 # --- メインUI ---
 st.title("🍟 〜生駒祭屋台シフト提出用〜")
-st.markdown("希望する日時を追加して、最後に提出してください。（スプレッドシート常時同期版）")
+st.markdown("希望する日時を追加して、最後に提出してください。（スプレッドシート安全同期版）")
 
 st.markdown("""
 <div class="norma-box">
@@ -179,11 +190,11 @@ with st.expander("👤 氏名を選択（ここをタップして名前を選ん
     )
     
     if user_name != "選択してください...":
-        has_submitted = any(s.get("名前") == user_name for s in st.session_state.submitted_shifts)
+        has_submitted = any(str(s.get("名前")) == user_name for s in st.session_state.submitted_shifts)
         if has_submitted:
             st.warning("📝 あなたは既にシフトを提出済みです。修正する場合は新しいシフトを追加して「提出（上書き）」するか、以下のボタンで白紙に戻せます。")
             if st.button("⚠️ 自分の提出済みシフトをすべてリセット（削除）する"):
-                updated_shifts = [s for s in st.session_state.submitted_shifts if s.get("名前") != user_name]
+                updated_shifts = [s for s in st.session_state.submitted_shifts if str(s.get("名前")) != user_name]
                 default_pref = st.session_state.user_prefs.get(user_name, {"9時間可能か": "-", "理由": "-", "入り方の希望": "-", "一人暮らし": "-"})
                 save_shift_to_gsheets(updated_shifts, user_name, default_pref)
                 st.success("提出済みのシフトをリセットしました！")
@@ -262,7 +273,7 @@ with st.container(border=True):
             
             for old_shift in st.session_state.submitted_shifts:
                 old_date_str = str(old_shift.get("開始", "")).split(" ")[0]
-                if old_shift.get("名前") == current_name and old_shift.get("希望順位") == priority and old_date_str != DATE_MAP[selected_day]:
+                if str(old_shift.get("名前")) == current_name and old_shift.get("希望順位") == priority and old_date_str != DATE_MAP[selected_day]:
                     parts = str(old_shift.get("開始", "")).split(" ")
                     end_parts = str(old_shift.get("終了", "")).split(" ")
                     if len(parts) > 1 and len(end_parts) > 1:
@@ -298,7 +309,7 @@ st.markdown("<br>", unsafe_allow_html=True)
 st.markdown("#### 📋 提出予定のシフト一覧")
 
 if len(st.session_state.shift_list) == 0:
-    st.info("まだシフトが追加されていません。（シフトに入れない場合は、アンケートに回答して下の राहुल提出する」を押してください）".replace("राहुल", ""))
+    st.info("まだシフトが追加されていません。（シフトに入れない場合は、アンケートに回答して下の「提出する」を押してください）")
 else:
     for i, shift in enumerate(st.session_state.shift_list):
         col1, col2 = st.columns([5, 2])
@@ -333,7 +344,6 @@ with btn_col2:
                 "一人暮らし": living_alone
             }
             
-            # 再度最新を取ってから差分更新（他人の同名上書き競合を防ぐ）
             current_shifts, _ = load_data_from_gsheets()
             
             submitted_days = set([shift["日付"] for shift in st.session_state.shift_list])
@@ -343,7 +353,7 @@ with btn_col2:
                 old_date_str = s_start.split(" ")[0] if " " in s_start else ""
                 
                 should_remove = False
-                if old_shift.get("名前") == current_name:
+                if str(old_shift.get("名前")) == current_name:
                     for day in submitted_days:
                         if DATE_MAP[day] == old_date_str:
                             should_remove = True
@@ -400,7 +410,7 @@ def draw_gantt_chart(data, title_suffix=""):
                 st.info(f"{target_day} のデータはまだありません。")
             else:
                 df_timeline = pd.DataFrame(day_shifts)
-                df_timeline["開始"] = pd.to_datetime(df_timeline["開始"])
+                df_timeline["开始" if "开始" in df_timeline.columns else "開始"] = pd.to_datetime(df_timeline["開始"])
                 df_timeline["終了"] = pd.to_datetime(df_timeline["終了"])
 
                 def get_sort_score(name):
@@ -637,7 +647,7 @@ if st.button("シフト案を自動作成する", type="primary", use_container_
                     if current_shift is None:
                         current_shift = row.to_dict()
                     else:
-                        if current_shift["名前"] == row["名前"] and current_shift["終了"] == row["開始"]:
+                        if current_shift["名前"] == row["名前"] and current_shift["終了"] == row["开始" if "开始" in row else "開始"]:
                             current_shift["終了"] = row["終了"] 
                         else:
                             merged_schedule.append(current_shift)
