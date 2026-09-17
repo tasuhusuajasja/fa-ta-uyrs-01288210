@@ -1328,17 +1328,35 @@ def draw_gantt_chart(
                     else "開始"
                 )
 
-                df_timeline["開始_dt"] = (
-                    pd.to_datetime(
-                        df_timeline[col_name]
-                    )
+                # 日時変換
+                # Google Sheets / 入力値の形式が混在していても
+                # ガントチャート全体を落とさないようにする
+                df_timeline["開始_dt"] = pd.to_datetime(
+                    df_timeline[col_name],
+                    errors="coerce"
                 )
 
-                df_timeline["終了_dt"] = (
-                    pd.to_datetime(
-                        df_timeline["終了"]
-                    )
+                df_timeline["終了_dt"] = pd.to_datetime(
+                    df_timeline.get("終了", pd.Series(index=df_timeline.index)),
+                    errors="coerce"
                 )
+
+                # 開始・終了のどちらかが日時として解釈できない行は
+                # ガントチャートからだけ除外する（元データは変更しない）
+                invalid_datetime = (
+                    df_timeline["開始_dt"].isna()
+                    | df_timeline["終了_dt"].isna()
+                )
+
+                if invalid_datetime.any():
+                    df_timeline = df_timeline.loc[~invalid_datetime].copy()
+
+                if df_timeline.empty:
+                    st.warning(
+                        f"{target_day} のシフトに日時を読み取れないデータがあります。"
+                        "そのデータはガントチャートには表示していません。"
+                    )
+                    continue
 
                 # -------------------------------------
                 # 並び順
