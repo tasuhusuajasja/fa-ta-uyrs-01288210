@@ -215,18 +215,19 @@ def load_data_from_gsheets():
 
 def save_shift_to_gsheets(new_rows, user_name, user_pref):
     """
-    シフトとアンケートをGoogle Sheetsへ保存する。
+    現在のユーザーのデータだけをGoogle Sheetsへ保存する。
+
+    new_rows には「このユーザーの新しいシフトだけ」を渡す。
+    他ユーザーのシフトを受け取ってシートへ再追加することはしない。
 
     【429対策】
-    - shifts と prefs の読み込みを batchGet で1回にまとめる
-    - get_all_values() / get_all_records() の複数回読み込みをしない
+    - shifts / prefs の検索に必要な読み込みを1回のbatchGetにまとめる
+    - get_all_values() / get_all_records() を使用しない
     - シート全体をclearして書き直さない
-    - シフトは自分の行だけ削除して、新しい行をまとめて追加
-    - prefsも自分の行だけ更新
-    - 保存後に st.cache_data.clear() を呼ばない
-      （全ユーザー共通キャッシュを毎回消すと、他ユーザーの
-       次回アクセスで大量のRead requestが発生するため）
-    - 429が一時的に発生した場合は指数的に待って再試行
+    - 他ユーザーの行は触らない
+    - 新しいシフトはappend_rows()で1回にまとめて追加
+    - prefsは対象ユーザーの行だけ更新
+    - 429時は指数的に待って再試行
     """
 
     client = get_gspread_client()
@@ -236,9 +237,32 @@ def save_shift_to_gsheets(new_rows, user_name, user_pref):
         "ikomakai_db"
     )
 
-    # 429対策。通常は最初の試行で成功する。
     retry_delays = [0, 2, 5, 10, 20]
     last_error = None
+
+    # 保存対象は現在ユーザーのものだけに限定する
+    user_rows_to_save = []
+
+    for nr in new_rows:
+        # 念のため、別ユーザーのデータが渡されても保存しない
+        if str(nr.get("名前", user_name)) != str(user_name):
+            continue
+
+        user_rows_to_save.append([
+            str(nr.get("名前", user_name)),
+            str(nr.get("開始", "")),
+            str(nr.get("終了", "")),
+            str(nr.get("希望順位", "")),
+            str(nr.get("表示区分", ""))
+        ])
+
+    pref_data = [
+        str(user_name),
+        str(user_pref.get("9時間可能か", "-")),
+        str(user_pref.get("理由", "-")),
+        str(user_pref.get("入り方の希望", "-")),
+        str(user_pref.get("一人暮らし", "-"))
+    ]
 
     for delay in retry_delays:
 
@@ -248,10 +272,9 @@ def save_shift_to_gsheets(new_rows, user_name, user_pref):
         try:
             ss = client.open(spreadsheet_name)
 
-            # =================================================
-            # shifts / prefs を1回のbatchGetで取得
-            # =================================================
-
+            # -------------------------------------------------
+            # 1回のbatchGetで shifts / prefs を取得
+            # -------------------------------------------------
             batch_result = ss.values_batch_get([
                 "shifts!A:E",
                 "prefs!A:E"
@@ -272,7 +295,7 @@ def save_shift_to_gsheets(new_rows, user_name, user_pref):
             )
 
             # =================================================
-            # shifts 保存
+            # shifts
             # =================================================
 
             shift_sheet = ss.worksheet("shifts")
@@ -285,7 +308,6 @@ def save_shift_to_gsheets(new_rows, user_name, user_pref):
                 "表示区分"
             ]
 
-            # シートが完全に空ならヘッダーを作成
             if not existing_values:
                 shift_sheet.update(
                     "A1:E1",
@@ -294,7 +316,7 @@ def save_shift_to_gsheets(new_rows, user_name, user_pref):
                 )
                 existing_values = [headers]
 
-            # A列の名前だけを見て、現在のユーザーの行を特定
+            # 現在ユーザーの既存行だけを取得
             user_rows = []
 
             for row_num, row_values in enumerate(
@@ -311,14 +333,11 @@ def save_shift_to_gsheets(new_rows, user_name, user_pref):
                     user_rows.append(row_num)
 
             # -------------------------------------------------
-            # 現在のユーザーの古い行だけ削除
+            # 自分の古い行だけ削除
             # -------------------------------------------------
-
             if user_rows:
                 delete_requests = []
 
-                # 下の行から削除することで、上の行番号が
-                # ずれないようにする。
                 for row_num in reversed(user_rows):
                     delete_requests.append({
                         "deleteDimension": {
@@ -331,35 +350,21 @@ def save_shift_to_gsheets(new_rows, user_name, user_pref):
                         }
                     })
 
-                # 削除リクエストは1回のbatchUpdateにまとめる
                 ss.batch_update({
                     "requests": delete_requests
                 })
 
             # -------------------------------------------------
-            # 新しいシフトをまとめて追加
+            # 自分の新しいシフトだけ追加
             # -------------------------------------------------
-
-            shift_values_to_append = []
-
-            for nr in new_rows:
-                shift_values_to_append.append([
-                    str(nr.get("名前", user_name)),
-                    str(nr.get("開始", "")),
-                    str(nr.get("終了", "")),
-                    str(nr.get("希望順位", "")),
-                    str(nr.get("表示区分", ""))
-                ])
-
-            # append_rowを何回も呼ばず、1回にまとめる
-            if shift_values_to_append:
+            if user_rows_to_save:
                 shift_sheet.append_rows(
-                    shift_values_to_append,
+                    user_rows_to_save,
                     value_input_option="USER_ENTERED"
                 )
 
             # =================================================
-            # prefs 保存
+            # prefs
             # =================================================
 
             pref_sheet = ss.worksheet("prefs")
@@ -396,45 +401,24 @@ def save_shift_to_gsheets(new_rows, user_name, user_pref):
                     pref_row = row_num
                     break
 
-            pref_data = [
-                str(user_name),
-                str(user_pref.get("9時間可能か", "-")),
-                str(user_pref.get("理由", "-")),
-                str(user_pref.get("入り方の希望", "-")),
-                str(user_pref.get("一人暮らし", "-"))
-            ]
-
-            # 既存ユーザーならその行だけ更新
             if pref_row is not None:
                 pref_sheet.update(
                     f"A{pref_row}:E{pref_row}",
                     [pref_data],
                     value_input_option="USER_ENTERED"
                 )
-
-            # 初めてなら新しい行を追加
             else:
                 pref_sheet.append_row(
                     pref_data,
                     value_input_option="USER_ENTERED"
                 )
 
-            # -------------------------------------------------
-            # 重要：ここで st.cache_data.clear() をしない
-            # -------------------------------------------------
-            # cache_dataは全ユーザーで共有されるため、
-            # 1人の保存ごとに全キャッシュを消すと、
-            # その直後に各ユーザーが再度Sheetsを読み込み、
-            # Read quotaを急激に消費する原因になる。
-
             return
 
         except Exception as e:
             last_error = e
-
             error_text = str(e)
 
-            # 429 / quota超過なら少し待って再試行
             if (
                 "429" not in error_text
                 and "Quota exceeded" not in error_text
@@ -714,8 +698,9 @@ with st.expander(
                     )
                 )
 
+                # リセットなので、このユーザーのシフトを0件にする
                 save_shift_to_gsheets(
-                    updated_shifts,
+                    [],
                     user_name,
                     default_pref
                 )
@@ -1221,9 +1206,15 @@ with btn_col2:
             # -----------------------------------------
             # Google Sheetsへ保存
             # -----------------------------------------
+            # filtered_shifts は「全員分」の表示用データ。
+            # 保存関数には、今回のユーザー分だけを渡す。
+            user_shifts_to_save = [
+                s for s in filtered_shifts
+                if str(s.get("名前", "")) == str(current_name)
+            ]
 
             save_shift_to_gsheets(
-                filtered_shifts,
+                user_shifts_to_save,
                 current_name,
                 new_pref_data
             )
